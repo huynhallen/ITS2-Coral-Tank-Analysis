@@ -1,0 +1,934 @@
+# =============================================================================
+# OIST coral tank ITS2 eDNA analysis, v3
+#
+# What changed from OIST_Tank_analysis_revised.R, and why:
+#   1. Heat and Flow are coded -0.5/+0.5, so every Heat/Flow row in every model
+#      is a true main effect (the old treatment coding gave simple effects).
+#   2. PERMANOVA now tests Heat and Flow main effects (additive model, margin)
+#      plus the interaction. The old file only reported Heat:Flow.
+#   3. A tank-label permutation test uses ALL samples and ALL dates. It
+#      compares between-treatment and within-treatment tank dissimilarity
+#      within each date, so date-wide shocks cancel out.
+#   4. Drift excludes each tank's first sample (it is 0 by construction) and
+#      uses days since that tank's own first sample.
+#   5. Turnover is modelled against log(gap days); distances saturate.
+#   6. Distance-to-control is replaced by a full same-date tank-pair table,
+#      with control-vs-control as the baseline.
+#   7. Host similarity gets a permutation null, own-tank rank, a
+#      "no generalist sequences" version, a presence/absence version, and a
+#      species-level reference.
+#   8. Sequence status uses prevalence thresholds (8534_A is no longer
+#      "detected in both" because of one host sample).
+#   9. Three scenarios rerun the core tests: all data, rare-sequence tail
+#      removed, and a core period without sparse dates or the long late gap.
+#  10. SIMPER p-values are gone. Sequence-level tests use tank means.
+#  11. Inlet QC, an other-date inlet null, and an other-tank host null for the
+#      overlap fractions.
+#  12. Every model effect goes into one table with CI and an approximate
+#      minimum detectable effect, so you can say what the design could detect.
+#
+# Terminology: the abundance tables are post-MED ITS2 sequences, not SymPortal
+# type profiles. This script calls them "sequences" throughout.
+# =============================================================================
+
+# ---- Packages ----------------------------------------------------------------
+required <- c("readxl", "vegan", "permute", "lme4", "lmerTest", "glmmTMB",
+              "car", "ape", "ggplot2", "dplyr", "tidyr", "tibble")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install these packages first: ", paste(missing, collapse = ", "))
+suppressPackageStartupMessages({
+  library(vegan); library(ggplot2); library(dplyr); library(tidyr)
+})
+
+# ---- Settings and paths: edit this block only --------------------------------
+BASE <- Sys.getenv("OIST_BASE",
+                   "/Users/allenhuynh/Desktop/eDNA-Okinawa-pref/2025tank-ishigaki")
+CFG <- list(
+  tank_file = file.path(BASE, "WaterSample/symportal_output/post_med_seqs/analysis/postmed_1500rarefied_tank_edna_relative_abundance.xlsx"),
+  tank_meta = file.path(BASE, "WaterSample/OIST_tank_edna_metadata.xlsx"),
+  host_file = file.path(BASE, "CoralHost/symportal_output/post_med_seqs/analysis/postmed_40k_rarefied_coral_host_relative_abundance.xlsx"),
+  host_meta = file.path(BASE, "CoralHost/OIST_Tank_CoralHost_metadata.xlsx"),
+  out_dir   = Sys.getenv("OIST_OUT", "/Users/allenhuynh/Desktop/R output/ITS2_tank_v3"),
+
+  seed = 123,
+  nperm = 9999,              # main permutation tests
+  nperm_small = 999,         # leave-one-date-out PERMANOVA
+  inlets_as_background = TRUE,
+
+  detect_min = 1 / 1500,     # host reads below this are zeroed (depth match)
+  host_prev_min = 0.10,      # "host-resident" = in >= 10% of host samples
+  water_prev_min = 0.05,     # "water-detected" = in >= 5% of water samples
+  generalist_host_prev = 0.50, # sequences in >= 50% of hosts = generalists
+  tail_prev_min = 0.05,      # tail-filter scenario keeps sequences in >= 5% of samples
+  seq_test_prev_min = 0.10,  # tank-level sequence tests need >= 10% prevalence
+
+  min_tanks_per_date = 6,    # core-period scenario drops dates with fewer tanks
+  long_gap_days = 30,        # ...and dates after the first gap longer than this
+
+  run_ou = TRUE,             # irregular-time autocorrelation sensitivity models
+  run_simper = TRUE          # descriptive SIMPER only (no p-values)
+)
+
+dir.create(CFG$out_dir, recursive = TRUE, showWarnings = FALSE)
+set.seed(CFG$seed)
+TREATMENT_COLS <- c(C = "#1f77b4", H = "#d62728", WF = "#2ca02c", HWF = "#ff7f0e")
+for (p in c(CFG$tank_file, CFG$tank_meta, CFG$host_file, CFG$host_meta)) {
+  if (!file.exists(p)) stop("Input file not found: ", p)
+}
+
+# Collected results across scenarios
+RES <- new.env()
+RES$effects <- list(); RES$vc <- list(); RES$beta <- list(); RES$anova <- list()
+collect <- function(slot, df) RES[[slot]] <- c(RES[[slot]], list(df))
+
+# ---- Utility functions --------------------------------------------------------
+strip_suffix <- function(x) sub("_S[0-9]+$", "", trimws(as.character(x)))
+
+read_abund <- function(path) {
+  x <- if (grepl("\\.xlsx?$", path, ignore.case = TRUE)) {
+    as.data.frame(readxl::read_excel(path), check.names = FALSE)
+  } else {
+    read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
+  }
+  if (ncol(x) < 2) stop("Abundance file needs sample IDs plus >= 1 sequence: ", path)
+  ids <- trimws(as.character(x[[1]]))
+  z <- x[, -1, drop = FALSE]
+  z[] <- lapply(z, function(v) suppressWarnings(as.numeric(as.character(v))))
+  m <- as.matrix(z); storage.mode(m) <- "numeric"
+  m[!is.finite(m)] <- 0
+  rownames(m) <- ids
+  if (anyDuplicated(rownames(m))) stop("Duplicate sample names in: ", path)
+  if (any(m < 0)) stop("Negative abundance values in: ", path)
+  m <- m[rowSums(m) > 0, colSums(m) > 0, drop = FALSE]
+  if (!nrow(m)) stop("No non-zero samples in: ", path)
+  m / rowSums(m)
+}
+
+classify_type <- function(x) {
+  dplyr::case_when(
+    grepl("NTC|nega|PosCT|Undetermined", x, ignore.case = TRUE) ~ "Control",
+    grepl("inlet", x, ignore.case = TRUE) ~ "Inlet",
+    TRUE ~ "Experimental")
+}
+
+add_treatment_factors <- function(md, code) {
+  code <- toupper(trimws(as.character(code)))
+  code[code == "CONTROL"] <- "C"
+  md$Treatment <- factor(code, levels = c("C", "H", "WF", "HWF"))
+  md$Heat <- factor(ifelse(code %in% c("H", "HWF"), "Heat", "NoHeat"),
+                    levels = c("NoHeat", "Heat"))
+  md$Flow <- factor(ifelse(code %in% c("WF", "HWF"), "Flow", "NoFlow"),
+                    levels = c("NoFlow", "Flow"))
+  md
+}
+
+# Clade from a post-MED sequence name: C3 -> C, 8534_A -> A, C3.10 -> C
+its2_clade <- function(x) {
+  first <- toupper(substr(x, 1, 1))
+  last <- toupper(sub("^.*_([A-Za-z])$", "\\1", x))
+  out <- ifelse(grepl("^[A-Za-z]", x), first,
+                ifelse(grepl("_[A-Za-z]$", x), last, NA_character_))
+  ifelse(out %in% LETTERS[1:9], out, "Other")
+}
+
+tank_key <- function(ids, ord) {
+  x <- tolower(strip_suffix(ids))
+  date <- sub("-.*$", "", x)
+  date <- ifelse(nchar(date) == 6, paste0("20", date), date)
+  rest <- sub("^[^-]*-", "", x)
+  tank <- suppressWarnings(as.integer(sub("^([0-9]+).*$", "\\1", rest)))
+  key <- ifelse(grepl("^[0-9]", rest), sprintf("%s-%02d", date, tank),
+                paste0(date, "-", rest))
+  tmp <- data.frame(key = key, ord = ord) |>
+    dplyr::group_by(key) |>
+    dplyr::mutate(n = dplyr::n(), r = rank(ord, ties.method = "first")) |>
+    dplyr::ungroup()
+  ifelse(tmp$n > 1, paste0(tmp$key, tmp$r), tmp$key)
+}
+
+# ---- Loaders (unchanged logic from the previous script) ----------------------
+load_tank <- function(file_path, meta_path) {
+  abund <- read_abund(file_path)
+  meta <- as.data.frame(readxl::read_excel(meta_path), check.names = FALSE)
+  meta <- meta[!is.na(meta[[1]]), , drop = FALSE]
+  info_col <- names(meta)[tolower(trimws(names(meta))) == "info"]
+  if (!length(info_col)) stop("Tank metadata needs an 'info' column.")
+  tank_col <- names(meta)[tolower(trimws(names(meta))) == "tank"]
+  meta$join_key <- tank_key(meta[[1]], seq_len(nrow(meta)))
+  meta <- meta[!duplicated(meta$join_key), , drop = FALSE]
+
+  ids <- rownames(abund)
+  s_num <- suppressWarnings(as.integer(sub("^.*_S([0-9]+)$", "\\1", ids)))
+  s_num[is.na(s_num)] <- seq_along(ids)[is.na(s_num)]
+  md <- data.frame(sample_name = ids, join_key = tank_key(ids, s_num),
+                   stringsAsFactors = FALSE)
+  md$Type <- classify_type(md$sample_name)
+  cat("\nSample types in abundance table:\n"); print(table(md$Type))
+  md <- md[md$Type %in% c("Experimental", "Inlet"), , drop = FALSE]
+  is_inlet <- md$Type == "Inlet"
+
+  tank_no <- suppressWarnings(as.integer(sub("^[^-]*-([0-9]+).*$", "\\1", md$sample_name)))
+  if (CFG$inlets_as_background) {
+    tank_no[is_inlet] <- 0L
+  } else if (length(tank_col)) {
+    inlet_tank <- suppressWarnings(as.integer(
+      meta[[tank_col[1]]][match(md$join_key, meta$join_key)]))
+    tank_no[is_inlet] <- inlet_tank[is_inlet]
+  } else stop("inlets_as_background = FALSE but no 'tank' column exists.")
+
+  no_tank <- is.na(tank_no)
+  if (any(no_tank)) {
+    cat("Dropping samples without a tank number:\n",
+        paste(md$sample_name[no_tank], collapse = ", "), "\n")
+    md <- md[!no_tank, , drop = FALSE]; tank_no <- tank_no[!no_tank]
+    is_inlet <- is_inlet[!no_tank]
+  }
+
+  codes <- c("C", "H", "WF", "HWF")
+  info <- toupper(trimws(as.character(meta[[info_col[1]]][match(md$join_key, meta$join_key)])))
+  pattern <- "^.*-[0-9]{2}(HWF|WF|H|C)(_S[0-9]+)?$"
+  id_code <- ifelse(grepl(pattern, md$sample_name),
+                    sub(pattern, "\\1", md$sample_name), NA_character_)
+  use_id <- !(info %in% codes) & !is_inlet
+  code <- ifelse(use_id, id_code, info)
+  code[is_inlet] <- NA_character_
+  md <- add_treatment_factors(md, code)
+  md$Heat[is_inlet] <- NA; md$Flow[is_inlet] <- NA
+
+  date_chr <- sub("-.*$", "", md$sample_name)
+  date_chr <- ifelse(nchar(date_chr) == 6, paste0("20", date_chr), date_chr)
+  md$Date_d <- as.Date(date_chr, format = "%Y%m%d")
+  if (anyNA(md$Date_d)) stop("Could not parse dates from: ",
+                             paste(md$sample_name[is.na(md$Date_d)], collapse = ", "))
+  md$Date <- factor(format(md$Date_d, "%Y%m%d"),
+                    levels = sort(unique(format(md$Date_d, "%Y%m%d"))))
+  md$Tank <- factor(ifelse(tank_no == 0L, "Inlet", sprintf("T%02d", tank_no)))
+  md$SampleKind <- factor(ifelse(is_inlet, "Inlet", "Water"), levels = c("Water", "Inlet"))
+  bad <- !is_inlet & is.na(md$Treatment)
+  if (any(bad)) stop("No treatment for: ", paste(md$sample_name[bad], collapse = ", "))
+  md <- md[order(md$Date_d, md$Tank, md$SampleKind), , drop = FALSE]
+  rownames(md) <- md$sample_name
+  list(abund = abund[md$sample_name, , drop = FALSE], metadata = md)
+}
+
+load_host <- function(file_path, meta_path) {
+  abund <- read_abund(file_path)
+  meta <- as.data.frame(readxl::read_excel(meta_path), check.names = FALSE)
+  names(meta)[1] <- "sample"
+  names(meta) <- tolower(trimws(names(meta)))
+  shade_col <- grep("shad", names(meta), ignore.case = TRUE, value = TRUE)[1]
+  needed <- c("tank", "condition", "species")
+  if (!all(needed %in% names(meta)) || is.na(shade_col)) {
+    stop("Host metadata needs tank, condition, species and a shading column.")
+  }
+  meta$join_key <- tolower(gsub("-", "_", strip_suffix(meta$sample)))
+  meta <- meta[!is.na(meta$sample) & !duplicated(meta$join_key), , drop = FALSE]
+  ids <- rownames(abund)
+  md <- data.frame(sample_name = ids,
+                   join_key = tolower(gsub("-", "_", strip_suffix(ids))),
+                   stringsAsFactors = FALSE)
+  md$Type <- classify_type(md$sample_name)
+  md <- md[md$Type == "Experimental", , drop = FALSE]
+  ix <- match(md$join_key, meta$join_key)
+  if (anyNA(ix)) cat("Host samples lacking metadata (dropped): ",
+                     paste(md$sample_name[is.na(ix)], collapse = ", "), "\n")
+  md <- md[!is.na(ix), , drop = FALSE]; ix <- ix[!is.na(ix)]
+  md <- add_treatment_factors(md, meta$condition[ix])
+  md$Tank <- factor(sprintf("T%02d", as.integer(meta$tank[ix])))
+  md$Shade <- factor(ifelse(trimws(as.character(meta[[shade_col]][ix])) == "S",
+                            "Shaded", "NotShaded"))
+  md$Species <- factor(trimws(as.character(meta$species[ix])))
+  md$Genus <- factor(sub(" .*$", "", trimws(as.character(meta$species[ix]))))
+  md <- md[order(md$Tank, md$Species), , drop = FALSE]
+  rownames(md) <- md$sample_name
+  list(abund = abund[md$sample_name, , drop = FALSE], metadata = md)
+}
+
+tank_set <- load_tank(CFG$tank_file, CFG$tank_meta)
+host_set <- load_host(CFG$host_file, CFG$host_meta)
+abund_all <- tank_set$abund; meta_all <- tank_set$metadata
+host_abund <- host_set$abund; host_meta <- host_set$metadata
+
+# ---- Water-only data, design checks, coverage --------------------------------
+meta <- droplevels(meta_all[meta_all$SampleKind == "Water", , drop = FALSE])
+abund <- abund_all[meta$sample_name, , drop = FALSE]
+abund <- abund[, colSums(abund) > 0, drop = FALSE]
+meta$Heat_c <- ifelse(meta$Heat == "Heat", 0.5, -0.5)   # centred codes: main effects
+meta$Flow_c <- ifelse(meta$Flow == "Flow", 0.5, -0.5)
+
+tank_design <- meta |> dplyr::distinct(Tank, Treatment, Heat, Flow) |> dplyr::arrange(Tank)
+if (anyDuplicated(tank_design$Tank)) stop("A tank has inconsistent treatment assignments.")
+write.csv(tank_design, file.path(CFG$out_dir, "Tank_design_check.csv"), row.names = FALSE)
+host_design <- host_meta |> dplyr::distinct(Tank, Treatment) |> dplyr::arrange(Tank)
+write.csv(dplyr::full_join(tank_design, host_design, by = "Tank", suffix = c("_water", "_host")),
+          file.path(CFG$out_dir, "Host_water_tank_assignment_check.csv"), row.names = FALSE)
+cat("\nTanks per treatment:\n"); print(table(tank_design$Treatment))
+
+coverage <- as.data.frame.matrix(table(format(meta$Date_d), as.character(meta$Tank)))
+write.csv(coverage, file.path(CFG$out_dir, "Sample_coverage_date_by_tank.csv"))
+if (anyDuplicated(paste(meta$Tank, meta$Date_d)))
+  warning("More than one sample for some tank-date; OU models will be skipped.")
+
+# ---- Shared helpers -----------------------------------------------------------
+align_seqs <- function(x, seqs) {
+  x <- as.matrix(x)
+  out <- matrix(0, nrow(x), length(seqs), dimnames = list(rownames(x), seqs))
+  out[, colnames(x)] <- x
+  rs <- rowSums(out); ok <- rs > 0
+  out[ok, ] <- out[ok, , drop = FALSE] / rs[ok]
+  out[!ok, ] <- NA_real_
+  out
+}
+
+collapse_mean <- function(x, group) {
+  z <- rowsum(as.matrix(x), group, reorder = TRUE)
+  z / as.numeric(table(factor(group, levels = rownames(z))))
+}
+
+renorm <- function(M) {
+  rs <- rowSums(M); ok <- !is.na(rs) & rs > 0
+  M[ok, ] <- M[ok, , drop = FALSE] / rs[ok]
+  M[!ok, ] <- NA_real_
+  M
+}
+
+# Bray-Curtis similarity (rows normalised) or Jaccard similarity (presence).
+sim_matrix <- function(W, R, method = c("bray", "jaccard")) {
+  method <- match.arg(method)
+  out <- matrix(NA_real_, nrow(W), nrow(R), dimnames = list(rownames(W), rownames(R)))
+  if (method == "bray") {
+    for (j in seq_len(nrow(R))) out[, j] <- 1 - 0.5 * rowSums(abs(sweep(W, 2, R[j, ])))
+  } else {
+    Wp <- (W > 0) * 1; Rp <- (R > 0) * 1
+    inter <- Wp %*% t(Rp)
+    uni <- outer(rowSums(Wp), rowSums(Rp), "+") - inter
+    out[] <- inter / uni
+  }
+  out
+}
+
+make_rhs <- function(tv) paste0("Heat_c * Flow_c + ", tv, " + Heat_c:", tv, " + Flow_c:", tv)
+
+safe_pcoa <- function(d, metadata, file, title, dir) {
+  pc <- tryCatch(ape::pcoa(d), error = function(e) NULL)
+  if (is.null(pc) || ncol(pc$vectors) < 2) return(invisible(NULL))
+  co <- as.data.frame(pc$vectors[, 1:2, drop = FALSE]); co$sample_name <- rownames(co)
+  pd <- dplyr::left_join(co, metadata, by = "sample_name")
+  pct <- round(100 * pc$values$Relative_eig[1:2], 1)
+  p <- ggplot(pd, aes(Axis.1, Axis.2, colour = Treatment)) +
+    geom_point(size = 2.8, alpha = 0.85) +
+    scale_colour_manual(values = TREATMENT_COLS, drop = FALSE) +
+    theme_bw(base_size = 12) +
+    labs(title = title, x = paste0("PCoA1 (", pct[1], "%)"), y = paste0("PCoA2 (", pct[2], "%)"))
+  ggsave(file.path(dir, file), p, width = 8, height = 6, dpi = 300)
+}
+
+line_plot <- function(data, y, ylab, file, dir, title = ylab) {
+  z <- data[!is.na(data[[y]]), , drop = FALSE]
+  if (!nrow(z)) return(invisible(NULL))
+  p <- ggplot(z, aes(Date_d, .data[[y]], colour = Treatment,
+                     group = interaction(Treatment, Tank))) +
+    geom_line(alpha = 0.25) + geom_point(alpha = 0.55, size = 1.5) +
+    stat_summary(aes(group = Treatment), fun = mean, geom = "line", linewidth = 1.1) +
+    scale_colour_manual(values = TREATMENT_COLS) + theme_bw(base_size = 12) +
+    labs(x = "Sampling date", y = ylab, title = title)
+  ggsave(file.path(dir, file), p, width = 9, height = 5.5, dpi = 300)
+}
+
+# ---- Model helpers ------------------------------------------------------------
+tidy_fixed <- function(m, label, tag, note = "") {
+  if (inherits(m, "glmmTMB")) {
+    cf <- as.data.frame(coef(summary(m))$cond)
+    names(cf) <- c("Estimate", "SE", "stat", "p"); cf$df <- Inf
+    note <- paste0(note, " pdHess=", isTRUE(m$sdr$pdHess))
+  } else {
+    cf <- as.data.frame(coef(summary(m)))
+    names(cf) <- c("Estimate", "SE", "df", "stat", "p")
+  }
+  crit <- qt(0.975, cf$df)
+  data.frame(Scenario = tag, Response = label, Term = rownames(cf),
+             Estimate = cf$Estimate, SE = cf$SE,
+             CI_low = cf$Estimate - crit * cf$SE, CI_high = cf$Estimate + crit * cf$SE,
+             p = cf$p, Approx_MDE_80pct = 2.8 * cf$SE,
+             Note = trimws(note), row.names = NULL)
+}
+
+var_comp <- function(m, label, tag) {
+  out <- tryCatch({
+    if (inherits(m, "glmmTMB")) {
+      vc <- glmmTMB::VarCorr(m)$cond
+      data.frame(Group = names(vc), Variance = vapply(vc, function(x) as.numeric(x[1, 1]), numeric(1)))
+    } else {
+      vc <- as.data.frame(lme4::VarCorr(m))
+      data.frame(Group = vc$grp, Variance = vc$vcov)
+    }
+  }, error = function(e) NULL)
+  if (is.null(out)) return(NULL)
+  out$Share <- out$Variance / sum(out$Variance)
+  out$Near_zero <- out$Variance < 1e-6 * max(out$Variance, 1e-12)
+  data.frame(Scenario = tag, Response = label, out, row.names = NULL)
+}
+
+finish_model <- function(m, label, tag, dir, diagnostics = TRUE) {
+  capture.output(summary(m), file = file.path(dir, paste0("Model_", label, "_summary.txt")))
+  an <- tryCatch(
+    if (inherits(m, "glmmTMB")) as.data.frame(car::Anova(m, type = "III")) else as.data.frame(anova(m)),
+    error = function(e) NULL)
+  if (!is.null(an)) {
+    write.csv(an, file.path(dir, paste0("Model_", label, "_tests.csv")))
+    an$Term <- rownames(an); collect("anova", cbind(Scenario = tag, Response = label, an))
+  }
+  collect("effects", tidy_fixed(m, label, tag))
+  collect("vc", var_comp(m, label, tag))
+  if (diagnostics) {
+    png(file.path(dir, paste0("Model_", label, "_diagnostics.png")), width = 1100, height = 500)
+    par(mfrow = c(1, 2))
+    r <- if (inherits(m, "glmmTMB")) residuals(m, type = "pearson") else resid(m)
+    plot(fitted(m), r, xlab = "Fitted", ylab = "Residuals", main = paste(label, "residuals")); abline(h = 0, lty = 2)
+    qqnorm(r, main = paste(label, "Q-Q")); qqline(r)
+    dev.off()
+  }
+  if (!inherits(m, "glmmTMB")) {
+    sr <- resid(m) / sigma(m)
+    if (any(abs(sr) > 3)) {
+      write.csv(data.frame(sample_name = names(sr)[abs(sr) > 3], scaled_resid = sr[abs(sr) > 3]),
+                file.path(dir, paste0("Model_", label, "_outliers.csv")), row.names = FALSE)
+    }
+  }
+  m
+}
+
+fit_gauss <- function(resp, data, rhs, tag, dir, label = resp) {
+  d <- data[!is.na(data[[resp]]), , drop = FALSE]
+  f <- as.formula(paste(resp, "~", rhs, "+ (1 | Tank) + (1 | Date)"))
+  m <- tryCatch(lmerTest::lmer(f, data = d, REML = TRUE),
+                error = function(e) { message("  LMM failed (", label, "): ", conditionMessage(e)); NULL })
+  if (is.null(m)) return(NULL)
+  finish_model(m, label, tag, dir)
+}
+
+fit_nb <- function(resp, data, rhs, tag, dir, label = resp) {
+  d <- data[!is.na(data[[resp]]), , drop = FALSE]
+  f <- as.formula(paste(resp, "~", rhs, "+ (1 | Tank) + (1 | Date)"))
+  m <- tryCatch(glmmTMB::glmmTMB(f, data = d, family = glmmTMB::nbinom2),
+                error = function(e) { message("  NB GLMM failed (", label, "): ", conditionMessage(e)); NULL })
+  if (is.null(m)) return(NULL)
+  finish_model(m, label, tag, dir)
+}
+
+# Sensitivity: Ornstein-Uhlenbeck autocorrelation within tank (irregular dates).
+fit_ou <- function(resp, data, rhs, tag, dir, label = resp) {
+  d <- data[!is.na(data[[resp]]), , drop = FALSE]
+  if (anyDuplicated(paste(d$Tank, d$Day_from_first_water))) return(NULL)
+  d$times <- glmmTMB::numFactor(d$Day_from_first_water)
+  f <- as.formula(paste(resp, "~", rhs, "+ (1 | Date) + ou(times + 0 | Tank)"))
+  m <- tryCatch(glmmTMB::glmmTMB(f, data = d, family = gaussian(), REML = TRUE),
+                error = function(e) { message("  OU model failed (", label, "): ", conditionMessage(e)); NULL })
+  if (is.null(m)) return(NULL)
+  finish_model(m, paste0(label, "_OU"), tag, dir, diagnostics = FALSE)
+}
+
+# ---- Trajectories ---------------------------------------------------------------
+build_traj <- function(meta_s, dmat) {
+  tr <- meta_s
+  tr$Drift_from_first <- NA_real_; tr$Turnover_from_prev <- NA_real_
+  tr$Days_between <- NA_real_; tr$Days_from_tank_first <- NA_real_
+  tr$Is_tank_first <- FALSE
+  for (tk in levels(tr$Tank)) {
+    ix <- which(tr$Tank == tk); ix <- ix[order(tr$Date_d[ix])]
+    if (!length(ix)) next
+    tr$Is_tank_first[ix[1]] <- TRUE
+    tr$Days_from_tank_first[ix] <- as.numeric(tr$Date_d[ix] - tr$Date_d[ix[1]])
+    if (length(ix) < 2) next
+    tr$Drift_from_first[ix[-1]] <- dmat[cbind(ix[-1], rep(ix[1], length(ix) - 1))]
+    tr$Turnover_from_prev[ix[-1]] <- dmat[cbind(ix[-1], ix[-length(ix)])]
+    tr$Days_between[ix[-1]] <- as.numeric(diff(tr$Date_d[ix]))
+  }
+  tr$LogGap_sc <- as.numeric(scale(log(tr$Days_between)))
+  rownames(tr) <- tr$sample_name
+  tr
+}
+
+# ---- Beta-diversity helpers ------------------------------------------------------
+tank_mean_for <- function(meta_s, abund_s, dates) {
+  rows <- meta_s$Date_d %in% dates
+  m <- meta_s[rows, , drop = FALSE]; a <- abund_s[rows, , drop = FALSE]
+  tm <- collapse_mean(a, as.character(m$Tank))
+  info <- as.data.frame(dplyr::distinct(m, Tank, Treatment, Heat, Flow))
+  rownames(info) <- as.character(info$Tank)
+  info <- droplevels(info[rownames(tm), , drop = FALSE])
+  info$sample_name <- rownames(info)
+  list(tm = tm, info = info)
+}
+
+run_adonis <- function(tm, info, method, nperm, variant, tag) {
+  d <- vegan::vegdist(tm, method = method, binary = method == "jaccard")
+  fits <- list(
+    additive_margin = quote(vegan::adonis2(d ~ Heat + Flow, data = info, permutations = nperm, by = "margin")),
+    factorial_terms = quote(vegan::adonis2(d ~ Heat * Flow, data = info, permutations = nperm, by = "terms")),
+    treatment_4level = quote(vegan::adonis2(d ~ Treatment, data = info, permutations = nperm)))
+  out <- lapply(names(fits), function(nm) {
+    set.seed(CFG$seed)
+    z <- as.data.frame(eval(fits[[nm]]))
+    z$Term <- rownames(z)
+    data.frame(Scenario = tag, Test = "PERMANOVA_tank_mean", Variant = variant, Metric = method,
+               Model = nm, z, row.names = NULL, check.names = FALSE)
+  })
+  dplyr::bind_rows(out)
+}
+
+run_betadisper <- function(tm, info, method, nperm, variant, tag) {
+  d <- vegan::vegdist(tm, method = method, binary = method == "jaccard")
+  dplyr::bind_rows(lapply(c("Treatment", "Heat", "Flow"), function(g) {
+    bd <- vegan::betadisper(d, info[[g]], bias.adjust = TRUE)
+    set.seed(CFG$seed)
+    pt <- vegan::permutest(bd, permutations = nperm)
+    data.frame(Scenario = tag, Test = "Betadisper", Variant = variant, Metric = method,
+               Model = g, F = pt$tab[1, "F"], p = pt$tab[1, "Pr(>F)"])
+  }))
+}
+
+pair_table <- function(meta_s, Bm, Jm) {
+  idx <- split(seq_len(nrow(meta_s)), as.character(meta_s$Date_d))
+  rows <- lapply(idx, function(ix) {
+    if (length(ix) < 2) return(NULL)
+    cb <- t(utils::combn(ix, 2)); a <- cb[, 1]; b <- cb[, 2]
+    data.frame(Date_d = meta_s$Date_d[a],
+               Tank_A = as.character(meta_s$Tank[a]), Tank_B = as.character(meta_s$Tank[b]),
+               Treat_A = as.character(meta_s$Treatment[a]), Treat_B = as.character(meta_s$Treatment[b]),
+               Bray = Bm[cbind(a, b)], Jaccard = Jm[cbind(a, b)])
+  })
+  pt <- dplyr::bind_rows(rows)
+  pt <- pt[pt$Tank_A != pt$Tank_B, , drop = FALSE]
+  pt$Pair_type <- paste(pmin(pt$Treat_A, pt$Treat_B), pmax(pt$Treat_A, pt$Treat_B), sep = "-")
+  pt$Same_treatment <- pt$Treat_A == pt$Treat_B
+  pt
+}
+
+# Tank-label permutation test using every date. Statistic = mean over dates of
+# (between-group dissimilarity - within-group dissimilarity). Labels are
+# permuted across whole tanks, so tanks, not samples, are the replicates.
+tank_perm_test <- function(pt, tank_info, factor_name, dist_col, nperm, tag) {
+  tanks <- as.character(tank_info$Tank)
+  lab <- setNames(as.character(tank_info[[factor_name]]), tanks)
+  ia <- match(pt$Tank_A, tanks); ib <- match(pt$Tank_B, tanks)
+  di <- as.integer(factor(as.character(pt$Date_d)))
+  d <- pt[[dist_col]]
+  stat <- function(l) {
+    same <- l[ia] == l[ib]
+    ws <- rowsum(d * same, di)[, 1]; wn <- rowsum(as.numeric(same), di)[, 1]
+    bs <- rowsum(d * !same, di)[, 1]; bn <- rowsum(as.numeric(!same), di)[, 1]
+    ok <- wn > 0 & bn > 0
+    if (!any(ok)) return(c(NA_real_, NA_real_, NA_real_, 0))
+    c(mean(bs[ok] / bn[ok] - ws[ok] / wn[ok]), mean(ws[ok] / wn[ok]), mean(bs[ok] / bn[ok]), sum(ok))
+  }
+  obs <- stat(unname(lab)[match(tanks, tanks)])
+  set.seed(CFG$seed)
+  null <- replicate(nperm, stat(sample(unname(lab)))[1])
+  data.frame(Scenario = tag, Test = "Tank_label_permutation_all_dates", Variant = "all_samples",
+             Metric = dist_col, Model = factor_name, Statistic_between_minus_within = obs[1],
+             Mean_within = obs[2], Mean_between = obs[3], N_dates_used = obs[4],
+             p = (1 + sum(null >= obs[1], na.rm = TRUE)) / (1 + sum(!is.na(null))))
+}
+
+# ---- Scenarios -------------------------------------------------------------------
+prep_scn <- function(meta_s, abund_s) {
+  meta_s <- droplevels(meta_s)
+  abund_s <- abund_s[meta_s$sample_name, , drop = FALSE]
+  abund_s <- abund_s[, colSums(abund_s) > 0, drop = FALSE]
+  meta_s$Day_from_first_water <- as.numeric(meta_s$Date_d - min(meta_s$Date_d))
+  meta_s$Day_sc <- as.numeric(scale(meta_s$Day_from_first_water))
+  list(meta = meta_s, abund = abund_s)
+}
+
+dates_sorted <- sort(unique(meta$Date_d))
+date_cov <- meta |> dplyr::group_by(Date_d) |> dplyr::summarise(N_tanks = dplyr::n_distinct(Tank), .groups = "drop")
+big_gap <- which(as.numeric(diff(dates_sorted)) > CFG$long_gap_days)
+cutoff <- if (length(big_gap)) dates_sorted[big_gap[1]] else max(dates_sorted)
+core_dates <- date_cov$Date_d[date_cov$N_tanks >= CFG$min_tanks_per_date & date_cov$Date_d <= cutoff]
+
+tail_keep <- colMeans(abund > 0) >= CFG$tail_prev_min
+abund_tail <- renorm(abund[, tail_keep, drop = FALSE])
+tail_ok <- !is.na(rowSums(abund_tail))
+
+scenarios <- list(
+  primary = prep_scn(meta, abund),
+  tail_filtered = prep_scn(meta[tail_ok, , drop = FALSE], abund_tail[tail_ok, , drop = FALSE]),
+  core_period = prep_scn(meta[meta$Date_d %in% core_dates, , drop = FALSE], abund)
+)
+cat("\nCore-period dates:", paste(format(core_dates), collapse = ", "), "\n")
+cat("Tail-filter keeps", sum(tail_keep), "of", length(tail_keep), "sequences\n")
+
+run_scenario <- function(tag, meta_s, abund_s) {
+  dir <- file.path(CFG$out_dir, tag); dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  cat("\n=== Scenario:", tag, "|", nrow(meta_s), "samples |", ncol(abund_s), "sequences ===\n")
+  rhs_day <- make_rhs("Day_sc")
+
+  ## ---- Alpha diversity ----
+  alpha <- meta_s
+  alpha$Richness <- rowSums(abund_s > 0)
+  alpha$Shannon <- vegan::diversity(abund_s, "shannon")
+  alpha$Simpson <- vegan::diversity(abund_s, "simpson")
+  alpha$Evenness <- ifelse(alpha$Richness > 1, alpha$Shannon / log(alpha$Richness), NA_real_)
+  rownames(alpha) <- alpha$sample_name
+  write.csv(alpha[, c("sample_name", "Tank", "Treatment", "Heat", "Flow", "Date_d",
+                      "Day_from_first_water", "Richness", "Shannon", "Simpson", "Evenness")],
+            file.path(dir, "Alpha_diversity_per_sample.csv"), row.names = FALSE)
+  alpha_long <- tidyr::pivot_longer(
+    alpha[, c("sample_name", "Tank", "Treatment", "Date_d", "Richness", "Shannon", "Simpson", "Evenness")],
+    c(Richness, Shannon, Simpson, Evenness), names_to = "Metric", values_to = "Value")
+  # Tank means first, then treatment: tanks are the replicates.
+  tank_means <- alpha_long |> dplyr::group_by(Treatment, Tank, Metric) |>
+    dplyr::summarise(Tank_mean = mean(Value, na.rm = TRUE), N_samples = dplyr::n(), .groups = "drop")
+  write.csv(tank_means, file.path(dir, "Alpha_tank_means.csv"), row.names = FALSE)
+  write.csv(tank_means |> dplyr::group_by(Treatment, Metric) |>
+              dplyr::summarise(N_tanks = dplyr::n(), Mean = mean(Tank_mean), SD = sd(Tank_mean), .groups = "drop"),
+            file.path(dir, "Alpha_treatment_summary_tank_level.csv"), row.names = FALSE)
+  write.csv(alpha_long |> dplyr::group_by(Treatment, Date_d, Metric) |>
+              dplyr::summarise(N_tanks = dplyr::n_distinct(Tank), Mean = mean(Value, na.rm = TRUE),
+                               SD = sd(Value, na.rm = TRUE), Low_n_flag = N_tanks < 3, .groups = "drop"),
+            file.path(dir, "Alpha_treatment_date_summary.csv"), row.names = FALSE)
+  p_alpha <- ggplot(alpha_long, aes(Date_d, Value, colour = Treatment, group = interaction(Treatment, Tank))) +
+    geom_line(alpha = 0.25) + geom_point(alpha = 0.45, size = 1.5) +
+    stat_summary(aes(group = Treatment), fun = mean, geom = "line", linewidth = 1.1) +
+    facet_wrap(~ Metric, scales = "free_y", ncol = 2) +
+    scale_colour_manual(values = TREATMENT_COLS) + theme_bw(base_size = 12) +
+    labs(title = paste("ITS2 alpha diversity,", tag), x = "Sampling date", y = NULL)
+  ggsave(file.path(dir, "Alpha_diversity_over_time.png"), p_alpha, width = 11, height = 7, dpi = 300)
+
+  fit_nb("Richness", alpha, rhs_day, tag, dir, "Richness_NB")
+  for (r in c("Shannon", "Simpson", "Evenness")) fit_gauss(r, alpha, rhs_day, tag, dir)
+  if (CFG$run_ou && tag == "primary") for (r in c("Shannon", "Evenness")) fit_ou(r, alpha, rhs_day, tag, dir)
+
+  ## ---- Trajectories ----
+  Bm <- as.matrix(vegan::vegdist(abund_s, "bray"))
+  Jm <- as.matrix(vegan::vegdist(abund_s, "jaccard", binary = TRUE))
+  tr <- build_traj(meta_s, Bm)
+  write.csv(tr[, c("sample_name", "Tank", "Treatment", "Heat", "Flow", "Date_d", "Is_tank_first",
+                   "Days_from_tank_first", "Drift_from_first", "Turnover_from_prev", "Days_between")],
+            file.path(dir, "Temporal_trajectory_metrics.csv"), row.names = FALSE)
+  dd <- tr[!is.na(tr$Drift_from_first), , drop = FALSE]   # first samples excluded
+  dd$DayTank_sc <- as.numeric(scale(dd$Days_from_tank_first))
+  fit_gauss("Drift_from_first", dd, make_rhs("DayTank_sc"), tag, dir, "Drift_excl_first")
+  td <- tr[!is.na(tr$Turnover_from_prev), , drop = FALSE]
+  if (nrow(td) >= 20) fit_gauss("Turnover_from_prev", td, "Heat_c * Flow_c + LogGap_sc", tag, dir, "Turnover_loggap")
+  line_plot(tr, "Drift_from_first", "Bray-Curtis from tank's first sample", "Drift_over_time.png", dir)
+  line_plot(tr, "Turnover_from_prev", "Bray-Curtis between consecutive samples", "Turnover_over_time.png", dir)
+
+  ## ---- Same-date tank pairs: replaces distance-to-control ----
+  pt <- pair_table(meta_s, Bm, Jm)
+  write.csv(pt, file.path(dir, "SameDate_tank_pair_distances.csv"), row.names = FALSE)
+  write.csv(pt |> dplyr::group_by(Pair_type, Same_treatment) |>
+              dplyr::summarise(N_pairs = dplyr::n(), Bray_mean = mean(Bray), Bray_sd = sd(Bray),
+                               Jaccard_mean = mean(Jaccard), Jaccard_sd = sd(Jaccard), .groups = "drop"),
+            file.path(dir, "SameDate_tank_pair_summary.csv"), row.names = FALSE)
+
+  ## ---- Tank-level tests ----
+  info_all <- as.data.frame(dplyr::distinct(meta_s, Tank, Treatment, Heat, Flow))
+  info_all <- info_all[order(info_all$Tank), ]
+  beta <- list()
+  for (fac in c("Treatment", "Heat", "Flow"))
+    for (dc in c("Bray", "Jaccard"))
+      beta[[length(beta) + 1]] <- tank_perm_test(pt, info_all, fac, dc, CFG$nperm, tag)
+
+  n_tanks <- nlevels(meta_s$Tank)
+  cov_d <- meta_s |> dplyr::group_by(Date_d) |> dplyr::summarise(N = dplyr::n_distinct(Tank), .groups = "drop")
+  bal_dates <- cov_d$Date_d[cov_d$N == n_tanks]
+  variants <- list(all_dates_unbalanced = unique(meta_s$Date_d))
+  if (length(bal_dates) >= 2) variants$balanced_dates <- bal_dates
+  if (length(bal_dates) >= 3)
+    for (d0 in seq_along(bal_dates))
+      variants[[paste0("balanced_minus_", format(bal_dates[d0]))]] <- bal_dates[-d0]
+  for (v in names(variants)) {
+    tmv <- tank_mean_for(meta_s, abund_s, variants[[v]])
+    np <- if (grepl("minus", v)) CFG$nperm_small else CFG$nperm
+    for (mth in c("bray", "jaccard")) {
+      beta[[length(beta) + 1]] <- run_adonis(tmv$tm, tmv$info, mth, np, v, tag)
+      if (v %in% c("all_dates_unbalanced", "balanced_dates"))
+        beta[[length(beta) + 1]] <- run_betadisper(tmv$tm, tmv$info, mth, np, v, tag)
+    }
+    if (v == "all_dates_unbalanced") {
+      safe_pcoa(vegan::vegdist(tmv$tm, "bray"), tmv$info, "PCoA_tank_mean_Bray.png",
+                paste("Tank means, Bray-Curtis,", tag), dir)
+      safe_pcoa(vegan::vegdist(tmv$tm, "jaccard", binary = TRUE), tmv$info, "PCoA_tank_mean_Jaccard.png",
+                paste("Tank means, Jaccard,", tag), dir)
+    }
+  }
+  beta_tab <- dplyr::bind_rows(beta)
+  write.csv(beta_tab, file.path(dir, "Beta_tests.csv"), row.names = FALSE)
+  collect("beta", beta_tab)
+
+  pc <- tryCatch(ape::pcoa(vegan::vegdist(abund_s, "bray")), error = function(e) NULL)
+  if (!is.null(pc)) {
+    pcd <- as.data.frame(pc$vectors[, 1:2, drop = FALSE]); pcd$sample_name <- rownames(pcd)
+    pcd <- dplyr::left_join(pcd, meta_s, by = "sample_name") |> dplyr::arrange(Tank, Date_d)
+    pct <- round(100 * pc$values$Relative_eig[1:2], 1)
+    p <- ggplot(pcd, aes(Axis.1, Axis.2, colour = Treatment)) +
+      geom_path(aes(group = Tank), alpha = 0.25) + geom_point(aes(shape = Tank), size = 2.2, alpha = 0.8) +
+      scale_colour_manual(values = TREATMENT_COLS) + scale_shape_manual(values = seq_len(nlevels(pcd$Tank))) +
+      theme_bw(base_size = 12) +
+      labs(title = paste("Sample-level PCoA (descriptive),", tag),
+           x = paste0("PCoA1 (", pct[1], "%)"), y = paste0("PCoA2 (", pct[2], "%)"))
+    ggsave(file.path(dir, "PCoA_water_samples_tank_paths.png"), p, width = 9, height = 7, dpi = 300)
+  }
+  invisible(NULL)
+}
+
+for (nm in names(scenarios)) run_scenario(nm, scenarios[[nm]]$meta, scenarios[[nm]]$abund)
+
+# =============================================================================
+# HOST REFERENCES, INLETS AND SEQUENCE STATUS (primary data)
+# =============================================================================
+cat("\n=== Host references, inlets, sequence status ===\n")
+dirH <- file.path(CFG$out_dir, "host_inlet"); dir.create(dirH, showWarnings = FALSE)
+meta_p <- scenarios$primary$meta; abund_p <- scenarios$primary$abund
+
+host_thr <- host_abund; host_thr[host_thr < CFG$detect_min] <- 0
+host_thr <- host_thr[rowSums(host_thr) > 0, , drop = FALSE]
+host_meta2 <- host_meta[rownames(host_thr), , drop = FALSE]
+seqs <- Reduce(union, list(colnames(abund_all), colnames(host_thr)))
+water_al <- align_seqs(abund_p, seqs)
+host_al <- align_seqs(host_thr, seqs)
+clade_of <- setNames(its2_clade(seqs), seqs)
+cat("Sequences: water", ncol(abund_p), "| host", ncol(host_thr), "| union", length(seqs), "\n")
+
+host_prev <- colMeans(host_al > 0, na.rm = TRUE)
+water_prev <- colMeans(water_al > 0, na.rm = TRUE)
+generalists <- names(host_prev)[host_prev >= CFG$generalist_host_prev]
+
+seq_tab <- data.frame(
+  ITS2_sequence = seqs, Clade = clade_of[seqs],
+  Host_mean_rel_abund = colMeans(host_al, na.rm = TRUE),
+  Water_mean_rel_abund = colMeans(water_al, na.rm = TRUE),
+  Host_prevalence = host_prev, Water_prevalence = water_prev,
+  Generalist_in_hosts = seqs %in% generalists) |>
+  dplyr::mutate(Status = dplyr::case_when(
+    Host_prevalence >= CFG$host_prev_min & Water_prevalence >= CFG$water_prev_min ~ "Shared",
+    Host_prevalence >= CFG$host_prev_min ~ "Host-resident, rare in water",
+    Water_prevalence >= CFG$water_prev_min ~ "Water-dominant, not host-resident",
+    TRUE ~ "Rare in both")) |>
+  dplyr::arrange(dplyr::desc(Water_mean_rel_abund))
+write.csv(seq_tab, file.path(dirH, "Sequence_status_host_vs_water.csv"), row.names = FALSE)
+write.csv(seq_tab |> dplyr::group_by(Status) |>
+            dplyr::summarise(N_sequences = dplyr::n(), Host_abundance = sum(Host_mean_rel_abund),
+                             Water_abundance = sum(Water_mean_rel_abund), .groups = "drop"),
+          file.path(dirH, "Sequence_status_abundance_summary.csv"), row.names = FALSE)
+
+clade_mat <- function(M) t(rowsum(t(M), clade_of[colnames(M)]))
+cw <- clade_mat(water_al); ch <- clade_mat(host_al)
+write.csv(data.frame(sample_name = rownames(cw), cw) |> dplyr::left_join(meta_p[, c("sample_name", "Tank", "Treatment", "Date_d")], by = "sample_name"),
+          file.path(dirH, "Clade_composition_water_per_sample.csv"), row.names = FALSE)
+write.csv(data.frame(sample_name = rownames(ch), ch, Tank = host_meta2$Tank, Species = host_meta2$Species),
+          file.path(dirH, "Clade_composition_host_per_sample.csv"), row.names = FALSE)
+
+# ---- Host-reference similarity with permutation null ----
+ref_from_hosts <- function(H, group) {
+  g <- split(rownames(H), group)
+  r <- do.call(rbind, lapply(g, function(ids) colMeans(H[ids, , drop = FALSE], na.rm = TRUE)))
+  r[!is.na(rowSums(r)), , drop = FALSE]
+}
+
+eval_ref <- function(Sim, lab) {
+  n <- nrow(Sim); own_idx <- match(lab, colnames(Sim))
+  own <- rep(NA_real_, n); ok <- !is.na(own_idx)
+  own[ok] <- Sim[cbind(which(ok), own_idx[ok])]
+  oth <- (rowSums(Sim, na.rm = TRUE) - own) / (ncol(Sim) - 1)
+  oth[is.na(own)] <- NA_real_
+  rk <- vapply(seq_len(n), function(i) if (is.na(own[i])) NA_real_ else 1 + sum(Sim[i, ] > own[i], na.rm = TRUE), numeric(1))
+  nearest <- apply(Sim, 1, function(s) if (all(is.na(s))) NA_character_ else colnames(Sim)[which.max(s)])
+  data.frame(Sim_own = own, Sim_other_mean = oth, Advantage = own - oth, Rank_own = rk, Nearest = nearest)
+}
+
+perm_own_advantage <- function(Sim, lab, nperm) {
+  ok <- !is.na(rowSums(Sim))
+  S <- rowsum(Sim[ok, , drop = FALSE], lab[ok])
+  n <- table(factor(lab[ok], levels = rownames(S))); S <- S / as.numeric(n)
+  common <- intersect(rownames(S), colnames(S)); k <- length(common)
+  if (k < 3) return(c(obs = NA, p = NA, k = k, null_mean = NA))
+  S <- S[common, common, drop = FALSE]; w <- as.numeric(n[common])
+  adv <- function(pi) { own <- S[cbind(seq_len(k), pi)]; sum(w * (own - (rowSums(S) - own) / (k - 1))) / sum(w) }
+  obs <- adv(seq_len(k)); set.seed(CFG$seed)
+  null <- replicate(nperm, adv(sample.int(k)))
+  c(obs = obs, p = (1 + sum(null >= obs)) / (1 + nperm), k = k, null_mean = mean(null))
+}
+
+wt <- as.character(meta_p$Tank)
+variants <- list(bray_all = list("bray", NULL), bray_no_generalists = list("bray", generalists),
+                 jaccard_all = list("jaccard", NULL), jaccard_no_generalists = list("jaccard", generalists))
+hs <- meta_p[, c("sample_name", "Tank", "Treatment", "Heat", "Flow", "Heat_c", "Flow_c", "Date", "Date_d", "Day_from_first_water", "Day_sc")]
+host_tests <- list()
+for (v in names(variants)) {
+  mth <- variants[[v]][[1]]; drop <- variants[[v]][[2]]
+  W <- water_al; H <- host_al
+  if (!is.null(drop)) { W[, drop] <- 0; H[, drop] <- 0; W <- renorm(W); H <- renorm(H) }
+  R <- ref_from_hosts(H, as.character(host_meta2$Tank))
+  Sim <- sim_matrix(W, R, mth)
+  ev <- eval_ref(Sim, wt)
+  names(ev) <- paste0(names(ev), "_", v)
+  hs <- cbind(hs, ev)
+  pr <- perm_own_advantage(Sim, wt, CFG$nperm)
+  host_tests[[v]] <- data.frame(Variant = v, Mean_advantage_own_minus_other = pr["obs"],
+    Permutation_null_mean = pr["null_mean"], p_one_sided = pr["p"], N_tanks = pr["k"],
+    Prop_own_is_nearest = mean(ev[[1 + 4]] == wt, na.rm = TRUE), Chance_prop = 1 / ncol(Sim),
+    Mean_rank_own = mean(ev[[4]], na.rm = TRUE), Expected_rank_chance = (ncol(Sim) + 1) / 2,
+    Share_samples_adv_positive = mean(ev[[3]] > 0, na.rm = TRUE), row.names = NULL)
+}
+rownames(hs) <- hs$sample_name
+write.csv(hs, file.path(dirH, "Host_similarity_per_sample.csv"), row.names = FALSE)
+write.csv(dplyr::bind_rows(host_tests), file.path(dirH, "Host_similarity_permutation_tests.csv"), row.names = FALSE)
+write.csv(hs |> dplyr::group_by(Tank, Treatment) |>
+            dplyr::summarise(dplyr::across(dplyr::starts_with("Advantage_"), ~ mean(.x, na.rm = TRUE)), .groups = "drop"),
+          file.path(dirH, "Host_similarity_advantage_by_tank.csv"), row.names = FALSE)
+
+for (v in c("bray_all", "bray_no_generalists")) {
+  hs[[paste0("Own_", v)]] <- hs[[paste0("Sim_own_", v)]]
+  fit_gauss(paste0("Own_", v), hs, make_rhs("Day_sc"), "host_inlet", dirH, paste0("HostSim_own_", v))
+  fit_gauss(paste0("Advantage_", v), hs, make_rhs("Day_sc"), "host_inlet", dirH, paste0("HostSim_advantage_", v))
+}
+line_plot(hs, "Sim_own_bray_all", "Similarity to own-tank host reference", "Host_similarity_over_time.png", dirH)
+line_plot(hs, "Advantage_bray_all", "Own minus other-tank host similarity", "Host_advantage_over_time.png", dirH)
+
+# Species-level references (exploratory): which host species do water samples resemble?
+if (nlevels(host_meta2$Species) > 1) {
+  sp_ref <- ref_from_hosts(host_al, as.character(host_meta2$Species))
+  Ssp <- sim_matrix(water_al, sp_ref, "bray")
+  sp_long <- data.frame(sample_name = rep(rownames(Ssp), ncol(Ssp)), Species = rep(colnames(Ssp), each = nrow(Ssp)),
+                        Similarity = as.vector(Ssp))
+  sp_long <- dplyr::left_join(sp_long, meta_p[, c("sample_name", "Tank", "Treatment")], by = "sample_name")
+  write.csv(sp_long |> dplyr::group_by(Tank, Treatment, Species) |>
+              dplyr::summarise(N_water = dplyr::n(), Mean_similarity = mean(Similarity, na.rm = TRUE), .groups = "drop"),
+            file.path(dirH, "Host_species_similarity_by_tank.csv"), row.names = FALSE)
+  write.csv(as.data.frame.matrix(table(host_meta2$Tank, host_meta2$Species)),
+            file.path(dirH, "Host_species_counts_per_tank.csv"))
+}
+
+# ---- Inlets ----
+inlet_rows <- meta_all$SampleKind == "Inlet"
+if (any(inlet_rows)) {
+  im <- meta_all[inlet_rows, , drop = FALSE]
+  ia_ <- align_seqs(abund_all[im$sample_name, , drop = FALSE], seqs)
+  i_dates <- as.character(im$Date_d)
+  inlet_means <- do.call(rbind, lapply(split(rownames(ia_), i_dates), function(ids) colMeans(ia_[ids, , drop = FALSE], na.rm = TRUE)))
+  Sin <- sim_matrix(water_al, inlet_means, "bray")
+  wd <- as.character(meta_p$Date_d)
+  ci <- match(wd, colnames(Sin)); same <- rep(NA_real_, nrow(Sin)); ok <- !is.na(ci)
+  same[ok] <- Sin[cbind(which(ok), ci[ok])]
+  other <- (rowSums(Sin, na.rm = TRUE) - ifelse(is.na(same), 0, same)) / (ncol(Sin) - ifelse(is.na(same), 0, 1))
+  inl <- cbind(hs[, c("sample_name", "Tank", "Treatment", "Date_d")],
+               Inlet_available = ok, Sim_same_date_inlet = round(same, 8),
+               Sim_other_date_inlets_mean = other, Advantage_same_minus_other = round(same - other, 8))
+  write.csv(inl, file.path(dirH, "Tank_water_similarity_to_inlet.csv"), row.names = FALSE)
+  pri <- perm_own_advantage(Sin, wd, CFG$nperm)
+  write.csv(data.frame(Test = "Same-date vs other-date inlet similarity (date labels permuted)",
+                       Mean_advantage = pri["obs"], Null_mean = pri["null_mean"], p_one_sided = pri["p"], N_dates = pri["k"], row.names = NULL),
+            file.path(dirH, "Inlet_date_permutation_test.csv"), row.names = FALSE)
+  top_seq <- apply(ia_, 1, function(x) names(which.max(x)))
+  inlet_qc <- data.frame(Inlet_sample = rownames(ia_), Date_d = im$Date_d, N_sequences = rowSums(ia_ > 0),
+                         Top_sequence = top_seq, Top_share = apply(ia_, 1, max))
+  write.csv(inlet_qc, file.path(dirH, "Inlet_per_sample_QC.csv"), row.names = FALSE)
+  date_qc <- inl |> dplyr::group_by(Date_d) |>
+    dplyr::summarise(N_water = dplyr::n(), Inlet_available = any(Inlet_available),
+                     Mean_sim = mean(Sim_same_date_inlet, na.rm = TRUE), Max_sim = if (any(!is.na(Sim_same_date_inlet))) max(Sim_same_date_inlet, na.rm = TRUE) else NA_real_,
+                     Flag_zero_similarity_all_tanks = Inlet_available & all(Sim_same_date_inlet < 1e-6, na.rm = TRUE), .groups = "drop")
+  write.csv(date_qc, file.path(dirH, "Inlet_date_QC.csv"), row.names = FALSE)
+
+  # Overlap fractions, with the other-tank host reference as a baseline.
+  R_all <- ref_from_hosts(host_al, as.character(host_meta2$Tank))
+  frac <- function(x, h, il) c(Host_and_inlet = sum(x[h & il]), Host_only = sum(x[h & !il]),
+                               Inlet_only = sum(x[!h & il]), Neither = sum(x[!h & !il]))
+  ov <- lapply(seq_len(nrow(meta_p)), function(i) {
+    tk <- wt[i]; dt <- wd[i]
+    if (!(tk %in% rownames(R_all)) || !(dt %in% rownames(inlet_means))) return(NULL)
+    x <- water_al[i, ]; il <- inlet_means[dt, ] > 0
+    own <- frac(x, R_all[tk, ] > 0, il)
+    oth <- Reduce("+", lapply(setdiff(rownames(R_all), tk), function(o) frac(x, R_all[o, ] > 0, il))) / (nrow(R_all) - 1)
+    data.frame(sample_name = meta_p$sample_name[i], Tank = tk, Treatment = as.character(meta_p$Treatment[i]), Date_d = meta_p$Date_d[i],
+               t(own), Host_total_own = own[1] + own[2],
+               Host_total_other_tank_ref_mean = oth[1] + oth[2], row.names = NULL)
+  })
+  ov <- dplyr::bind_rows(ov)
+  if (nrow(ov)) {
+    ov$Host_total_advantage <- ov$Host_total_own - ov$Host_total_other_tank_ref_mean
+    write.csv(ov, file.path(dirH, "Reference_overlap_per_sample.csv"), row.names = FALSE)
+    ovs <- ov |> dplyr::group_by(Treatment, Date_d) |>
+      dplyr::summarise(dplyr::across(c(Host_and_inlet, Host_only, Inlet_only, Neither), mean), N_tanks = dplyr::n_distinct(Tank), .groups = "drop")
+    write.csv(ovs, file.path(dirH, "Reference_overlap_summary.csv"), row.names = FALSE)
+    p <- ggplot(tidyr::pivot_longer(ovs, c(Host_and_inlet, Host_only, Inlet_only, Neither), names_to = "Overlap", values_to = "Fraction"),
+                aes(Date_d, Fraction, fill = Overlap)) + geom_col() + facet_wrap(~ Treatment, ncol = 2) +
+      theme_bw(base_size = 11) +
+      labs(title = "Water read fraction by reference overlap (descriptive, not source apportionment)",
+           x = "Sampling date", y = "Mean fraction")
+    ggsave(file.path(dirH, "Reference_overlap_over_time.png"), p, width = 10, height = 7, dpi = 300)
+  }
+} else message("No inlet samples found; inlet analyses skipped.")
+
+# =============================================================================
+# SEQUENCE-LEVEL TESTS WITH TANKS AS REPLICATES (replaces SIMPER p-values)
+# =============================================================================
+tm_all <- collapse_mean(abund_p, as.character(meta_p$Tank))
+tinfo <- as.data.frame(dplyr::distinct(meta_p, Tank, Heat, Flow)); rownames(tinfo) <- as.character(tinfo$Tank)
+tinfo <- tinfo[rownames(tm_all), ]
+keep <- colMeans(abund_p > 0) >= CFG$seq_test_prev_min
+X <- tm_all[, keep, drop = FALSE]
+seq_res <- list()
+for (fac in c("Heat", "Flow")) {
+  lab <- as.integer(tinfo[[fac]] == levels(tinfo[[fac]])[2])
+  n1 <- sum(lab); n0 <- sum(1 - lab)
+  obs <- colMeans(X[lab == 1, , drop = FALSE]) - colMeans(X[lab == 0, , drop = FALSE])
+  set.seed(CFG$seed)
+  perms <- replicate(CFG$nperm, sample(lab))                       # tanks x nperm
+  null <- (t(perms) %*% X) / n1 - (t(1 - perms) %*% X) / n0       # nperm x seqs
+  exceed <- colSums(abs(null) >= matrix(abs(obs), nrow(null), ncol(null), byrow = TRUE))
+  pv <- (1 + exceed) / (1 + CFG$nperm)
+  seq_res[[fac]] <- data.frame(Factor = fac, ITS2_sequence = colnames(X), Clade = clade_of[colnames(X)],
+                               Tank_mean_level1 = colMeans(X[lab == 1, , drop = FALSE]),
+                               Tank_mean_level0 = colMeans(X[lab == 0, , drop = FALSE]),
+                               Diff_level1_minus_level0 = obs, N_tanks_level1 = n1, N_tanks_level0 = n0,
+                               p_perm = pv, p_BH = p.adjust(pv, "BH"), row.names = NULL)
+}
+write.csv(dplyr::bind_rows(seq_res) |> dplyr::arrange(p_perm),
+          file.path(dirH, "Sequence_tank_level_tests_Heat_Flow.csv"), row.names = FALSE)
+
+if (CFG$run_simper) {
+  sp <- tryCatch(vegan::simper(abund_p, group = meta_p$Treatment, permutations = 0), error = function(e) NULL)
+  if (!is.null(sp)) {
+    st <- lapply(names(summary(sp)), function(cmp) {
+      z <- as.data.frame(summary(sp)[[cmp]]); z$ITS2_sequence <- rownames(z); z$Comparison <- cmp
+      z[, intersect(c("Comparison", "ITS2_sequence", "average", "ava", "avb", "cumsum"), names(z))]
+    })
+    write.csv(dplyr::bind_rows(st), file.path(dirH, "SIMPER_descriptive_no_pvalues.csv"), row.names = FALSE)
+  }
+}
+
+# ---- Composition plot ----
+top15 <- names(sort(colMeans(abund_p), decreasing = TRUE))[seq_len(min(15, ncol(abund_p)))]
+long_ab <- as.data.frame(abund_p) |> tibble::rownames_to_column("sample_name") |>
+  tidyr::pivot_longer(-sample_name, names_to = "ITS2_sequence", values_to = "Relative_abundance") |>
+  dplyr::left_join(meta_p[, c("sample_name", "Treatment", "Date_d")], by = "sample_name") |>
+  dplyr::mutate(Group = ifelse(ITS2_sequence %in% top15, ITS2_sequence, "Other")) |>
+  dplyr::filter(Relative_abundance > 0)
+p <- ggplot(long_ab, aes(sample_name, Relative_abundance, fill = Group)) + geom_col(width = 1) +
+  facet_grid(Treatment ~ Date_d, scales = "free_x", space = "free_x") + theme_bw(base_size = 8) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), panel.spacing = unit(0.08, "lines")) +
+  labs(title = "Tank-water ITS2 composition (top 15 sequences)", x = "Sample", y = "Relative abundance", fill = "Sequence")
+ggsave(file.path(CFG$out_dir, "ITS2_composition_top15.png"), p, width = 16, height = 9, dpi = 300)
+write.csv(data.frame(ITS2_sequence = colnames(abund_p), Clade = clade_of[colnames(abund_p)],
+                     Prevalence = colMeans(abund_p > 0), Mean_rel_abund = colMeans(abund_p)) |> dplyr::arrange(dplyr::desc(Prevalence)),
+          file.path(CFG$out_dir, "Water_sequence_prevalence.csv"), row.names = FALSE)
+
+# =============================================================================
+# COMBINED TABLES, MANIFEST, REPRODUCIBILITY
+# =============================================================================
+write.csv(dplyr::bind_rows(RES$effects), file.path(CFG$out_dir, "ALL_model_fixed_effects.csv"), row.names = FALSE)
+write.csv(dplyr::bind_rows(RES$vc), file.path(CFG$out_dir, "ALL_model_variance_components.csv"), row.names = FALSE)
+write.csv(dplyr::bind_rows(RES$anova), file.path(CFG$out_dir, "ALL_model_type3_tests.csv"), row.names = FALSE)
+write.csv(dplyr::bind_rows(RES$beta), file.path(CFG$out_dir, "ALL_beta_tests.csv"), row.names = FALSE)
+writeLines(capture.output(str(CFG), sessionInfo()), file.path(CFG$out_dir, "Run_config_and_sessionInfo.txt"))
+files <- list.files(CFG$out_dir, recursive = TRUE)
+write.csv(data.frame(File = files, Size_KB = round(file.size(file.path(CFG$out_dir, files)) / 1024, 1)),
+          file.path(CFG$out_dir, "Output_manifest.csv"), row.names = FALSE)
+
+cat("\nDone. Outputs in:", CFG$out_dir, "\n")
+cat("Reminder: water sampling began after treatments started. Nothing here is a\n")
+cat("pre-treatment baseline contrast. With 12 tanks (C = 2, WF = 2), read the\n")
+cat("effect sizes and Approx_MDE_80pct columns, not only the p-values.\n")
